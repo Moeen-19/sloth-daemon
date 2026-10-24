@@ -22,7 +22,9 @@ You are building **sloth-daemon**: a Rust Linux daemon that uses an eBPF probe (
 - **Small, verifiable steps.** After each meaningful change, build or test it. Never stack up large unverified changes.
 - **Do not invent facts.** If you are not sure of an aya API, a cgroup file name, or an Ollama field, check the crate docs or kernel docs, or ask. Do not guess signatures from memory. aya's API has changed between versions, so read the version pinned in `Cargo.lock`.
 - **Report honestly.** If a test fails, say it failed. Never claim something works unless you ran it.
-- **At the end of each phase**, summarise in a few lines: what was done, what was verified and how, and anything the user must do (for example, run a command that needs root). **Then stop and wait for the user's go-ahead before starting the next phase.** This checkpoint is required after every phase.
+- **Be brief.** Credits are limited and this is a small project. Keep every message short: no essays, no restating the blueprint, no per-subtask reports, and no listing of files or checks that went fine. Report problems in detail and successes in a line.
+- **At the end of each phase**, reply with at most about 10 lines: what works, anything that failed or deviated from the blueprint, and any exact command the user must run (for example, one that needs root). **Then stop and wait for the user's go-ahead before starting the next phase.** This checkpoint is required after every phase.
+- **Checks the user can do themselves** (running sudo tests, reading logs, comparing against `top`): give the exact command in one line and say "you run this". Do not try to substitute for them with long analysis.
 
 ## 3. Tech Stack (Fixed)
 
