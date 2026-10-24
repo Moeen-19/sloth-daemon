@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "sloth-daemon",
+    "sloth-ebpf",
+]
+default-members = ["sloth-daemon"]
+resolver = "2"

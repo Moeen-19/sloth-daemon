@@ -1,0 +1,22 @@
+# Sloth Daemon Configuration
+dry_run = true
+
+[sampling]
+interval_secs = 2
+cpu_threshold_pct = 90.0
+sustained_secs = 30
+
+[throttle]
+quota_pct = 20
+max_concurrent = 5
+ttl_secs = 600
+release_below_pct = 50.0
+
+[ai]
+ollama_url = "http://localhost:11434"
+model = "llama3.2:3b"
+timeout_secs = 20
+min_confidence = 0.8
+
+[protected]
+extra_names = []

@@ -1,0 +1,3 @@
+cargo:rerun-if-env-changed=SLOTH_EBPF_PATH
+cargo:rerun-if-env-changed=SLOTH_FORCE_PLACEHOLDER
+cargo:rerun-if-changed=/home/tls_123/sloth-daemon/target/bpfel-unknown-none/release/sloth-ebpf
