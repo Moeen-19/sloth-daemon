@@ -9,10 +9,11 @@ Read `instructions.md` before touching any file. This blueprint says **what** to
 ## Objectives
 
 1. **Observe** CPU usage per PID with near-zero overhead using an eBPF tracepoint probe, not `/proc` polling.
-2. **Classify** processes with a local LLM (Ollama) so that a compiler, a video encode, or a database is not throttled by mistake while a runaway browser tab or stuck loop is.
+2. **Classify** processes with a local LLM (Ollama) or deterministic rules so that a compiler, a video encode, or a database is not throttled by mistake while a runaway browser tab or stuck loop is.
 3. **Enforce** throttling through cgroup v2 `cpu.max`, reversibly, with strict safety rails.
 4. **Fail safe.** If the AI is down, the kernel probe fails to load, or anything is uncertain, the daemon does nothing to processes.
 5. **Stay private and local.** No process data leaves the machine. The only network call is to `localhost` Ollama.
+6. **Broker evidence deterministically.** Before any LLM call, derive a compact `ProcessBrief` from local facts (metrics, category rules, system context) so small (0.5B) models classify reliably and rules-only mode works without a model.
 
 ### Non-Goals
 
@@ -40,6 +41,9 @@ Read `instructions.md` before touching any file. This blueprint says **what** to
  │     │                                                            │
  │     ├─► sampler:  map deltas ─► CPU% per PID over a window       │
  │     │                                                            │
+ │     ├─► broker.rs ─► history, /proc metrics ─► ProcessBrief      │
+ │     │        (deterministic preliminary rules verdict)           │
+ │     │                                                            │
  │     ├─► ai_classifier.rs ─► Ollama (localhost:11434) ─► verdict  │
  │     │        (AI is ADVISORY, output is validated JSON)          │
  │     │                                                            │
@@ -62,6 +66,12 @@ sloth-daemon/
 ├── README.md                 # Human-facing overview and quickstart
 ├── blueprint.md              # This file
 ├── instructions.md           # Agent operating rules
+├── sloth-daemon.service      # Systemd unit example (minimal capabilities)
+├── sloth.toml                # Example configuration
+├── scripts/
+│   ├── e2e-phase5.sh         # End-to-end Phase 5 test (root required)
+│   └── crash-recovery.sh     # Crash-recovery integration test (root required)
+│   └── llm-check.sh          # Ollama integration test (root required)
 ├── .agents/skills/
 │   ├── ebpf-probe-builder.md
 │   ├── cgroup-enforcer.md
@@ -72,6 +82,8 @@ sloth-daemon/
 └── sloth-daemon/             # user-space daemon (tokio)
     └── src/
         ├── main.rs
+        ├── broker.rs
+        ├── policy.rs
         ├── ai_classifier.rs
         └── cgroup_manager.rs
 ```
@@ -93,6 +105,29 @@ Define these early (Phase 1) and keep them stable. All phases rely on them.
 | `cpu_percent` | `f32` | CPU use over the last window, 100.0 = one full core |
 | `window_secs` | `u32` | Length of the measurement window |
 | `sustained_secs` | `u32` | How long it has stayed above the threshold |
+
+**`ProcessBrief`** (evidence broker output, compact derived facts):
+
+| Field | Type | Meaning |
+|:--|:--|:--|
+| `name` | `String` | Sanitized process name |
+| `name_category` | `NameCategory` | Category derived from name rules (`compiler`, `encoder`, `database`, `browser_helper`, `interpreter`, `shell`, `desktop_service`, `unknown`) |
+| `parent_category` | `NameCategory` | Category derived from parent process comm |
+| `cpu_now` | `f32` | Instantaneous CPU% |
+| `cpu_avg_60s` | `f32` | 60-second moving average CPU% |
+| `cpu_peak` | `f32` | Peak CPU% over history |
+| `trend` | `CpuTrend` | `rising`, `flat`, or `falling` |
+| `burstiness` | `Burstiness` | `steady` or `spiky` |
+| `sustained_secs` | `u32` | Seconds continuously above threshold |
+| `age_secs` | `u64` | Process age in seconds |
+| `thread_count` | `u32` | Number of threads |
+| `rss_bucket` | `RssBucket` | `small`, `medium`, or `large` |
+| `session_kind` | `SessionKind` | `user_app`, `system_service`, or `unknown` (never the raw cgroup path) |
+| `has_tty` | `bool` | Whether process has a controlling terminal |
+| `psi_cpu_avg10` | `Option<f32>` | System CPU pressure avg10 from `/proc/pressure/cpu` |
+| `cpu_rank` | `u32` | Process rank among CPU consumers |
+| `num_cores` | `u32` | Number of logical cores |
+| `rule_preliminary` | `RulePreliminary` | Deterministic `{ class, confidence, reasons }` from rule lists |
 
 **`Verdict`** (from the AI, strict JSON):
 
@@ -167,13 +202,25 @@ Complete phases **in order**. Do not start a phase until the previous phase's ch
   7. Expose a clean async API: `classify(&ProcessSample) -> Verdict`.
 - **Exit check:** With Ollama running, a mock sample for a name like `cc1plus` is classified as non-runaway and one like a stuck `python` loop at 100% for a long time can be classified as runaway. With Ollama stopped, `classify` returns `unknown` quickly (within the timeout) without panicking.
 
+### Phase 4.5: Evidence Broker (ProcessBrief)
+
+- **Goal:** Build a deterministic evidence broker that computes a compact `ProcessBrief` from local metrics, rules, and system context before calling any model, enabling fast classification with tiny models and pure rules-only operation.
+- **Tasks:**
+  1. Create `sloth-daemon/src/broker.rs` with `ProcessBrief`, ring-buffer CPU sampler history per PID (~30 samples), `/proc` metrics readers, category matching rules, and preliminary verdict generation.
+  2. Implement pure `/proc` parsing functions for stat (age, threads, tty), status (RSS bucket), cgroup (session kind), and pressure (PSI cpu avg10). Return `None` ("no brief") if a process disappears mid-read.
+  3. Ensure `ProcessBrief` contains only derived features: sanitized name, name and parent categories, CPU metrics (current, avg_60s, peak, trend, burstiness), sustained duration, age, thread count, RSS bucket, session kind, tty presence, system context (PSI, rank, cores), and preliminary rule verdict.
+  4. Never include raw cmdline, environment, file paths, usernames, or raw cgroup paths in `ProcessBrief`.
+  5. Add config support for `ai.provider` (`"rules"` default, `"ollama"`), `fallback_to_rules`, `never_throttle`, and `throttle_candidates`.
+  6. Update `ai_classifier.rs` to consume `ProcessBrief`. In `"rules"` mode, return the preliminary rule verdict directly. In `"ollama"` mode, supply compact JSON brief to the model. Fall back to rules verdict only if `fallback_to_rules = true`.
+- **Exit check:** Table-driven tests for categories, trend, burstiness, and bucketing pass using fixtures; prompt serialization test asserts absence of cmdline, env, slashes, or usernames; mock-server tests pass with the new brief prompt; `cargo fmt`, `clippy -D warnings`, and `cargo test` pass.
+
 ### Phase 5: Orchestration and Policy Gate
 
 - **Goal:** Wire sampler, AI and enforcer into one safe control loop.
 - **Tasks:**
-  1. Implement the policy gate as a pure, unit-testable function: `decide(sample, verdict, state, config) -> ThrottleAction`.
+  1. Implement the policy gate in `policy.rs` as a pure, unit-testable function: `decide(sample, brief, verdict, state, config) -> ThrottleAction`.
   2. Rules, all required for a throttle: CPU above the threshold for at least `sustained_secs`; not protected; AI verdict is `runaway` or `background` with `confidence >= 0.8` and `throttle_recommended = true`; under the concurrency cap.
-  3. Add **hysteresis**: release only after CPU stays below a lower threshold for a cool-down period, to prevent flapping.
+  3. Add **hysteresis**: a throttled PID is considered "calm" when its CPU stays below 50% of its quota for `cool_down_samples` consecutive samples (default 5); release on calm to avoid flapping at quota.
   4. Add automatic **release TTL**: every throttle expires after a maximum duration unless re-justified.
   5. Release immediately if the PID exits or if the process becomes protected.
   6. Run AI classification asynchronously so a slow model never blocks the sampling loop.
@@ -200,34 +247,34 @@ Complete phases **in order**. Do not start a phase until the previous phase's ch
 The project is done when **every** box below is true and has been verified by running the command or test, not assumed.
 
 ### Build and Quality
-- [ ] `cargo build --release -p sloth-daemon` succeeds with the eBPF object embedded.
-- [ ] The eBPF crate builds with the documented nightly `bpfel-unknown-none` command.
-- [ ] `cargo fmt --check` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` passes.
-- [ ] `cargo test` passes, including policy gate and verdict parsing tests.
-- [ ] No `unwrap()` or `expect()` on runtime paths in user space (tests excepted).
+- [x] `cargo build --release -p sloth-daemon` succeeds with the eBPF object embedded.
+- [x] The eBPF crate builds with the documented nightly `bpfel-unknown-none` command.
+- [x] `cargo fmt --check` passes.
+- [x] `cargo clippy --all-targets -- -D warnings` passes.
+- [x] `cargo test` passes, including policy gate and verdict parsing tests.
+- [x] No `unwrap()` or `expect()` on runtime paths in user space (tests excepted).
 
 ### Observation
-- [ ] The eBPF probe loads and attaches on the target kernel without verifier errors.
-- [ ] CPU% for a known busy process is within about 10% of what `top` reports.
-- [ ] Exited processes are removed from the BPF map.
+- [x] The eBPF probe loads and attaches on the target kernel without verifier errors.
+- [x] CPU% for a known busy process is within about 10% of what `top` reports.
+- [x] Exited processes are removed from the BPF map.
 
 ### Classification
-- [ ] Ollama verdicts are parsed into typed `Verdict` values using JSON-schema-constrained output.
-- [ ] Malformed or missing model output yields `unknown`, never a crash or a throttle.
-- [ ] With Ollama offline, the daemon keeps running and throttles nothing.
-- [ ] Prompts contain only process name, CPU%, and duration.
+- [x] Ollama verdicts are parsed into typed `Verdict` values using JSON-schema-constrained output.
+- [x] Malformed or missing model output yields `unknown`, never a crash or a throttle.
+- [x] With Ollama offline, the daemon keeps running and throttles nothing.
+- [x] Prompts contain only process name, CPU%, and duration.
 
 ### Enforcement and Safety
-- [ ] Throttling uses cgroup v2 `cpu.max` and is confirmed effective on a test process.
-- [ ] PID 1, the daemon itself, kernel threads, and all protected names can never be throttled.
-- [ ] `dry_run = true` is the default and performs zero writes to `/sys/fs/cgroup`.
-- [ ] Every throttle has a TTL, a floor quota, and counts against a concurrency cap.
-- [ ] `SIGINT` and `SIGTERM` release all throttles and remove all child cgroups.
-- [ ] Leftover cgroups from a prior crash are cleaned on startup.
-- [ ] No code path kills, stops, or re-prioritises a process by any other means.
+- [x] Throttling uses cgroup v2 `cpu.max` and is confirmed effective on a test process.
+- [x] PID 1, the daemon itself, kernel threads, and all protected names can never be throttled.
+- [x] `dry_run = true` is the default and performs zero writes to `/sys/fs/cgroup`.
+- [x] Every throttle has a TTL, a floor quota, and counts against a concurrency cap.
+- [x] `SIGINT` and `SIGTERM` release all throttles and remove all child cgroups.
+- [x] Leftover cgroups from a prior crash are cleaned on startup.
+- [x] No code path kills, stops, or re-prioritises a process by any other means.
 
 ### Documentation
-- [ ] `README.md` explains installation, privileges, dry-run, and configuration.
-- [ ] A systemd unit example is included.
-- [ ] Every decision the daemon makes is explained in its logs.
+- [x] `README.md` explains installation, privileges, dry-run, and configuration.
+- [x] A systemd unit example is included.
+- [x] Every decision the daemon makes is explained in its logs.

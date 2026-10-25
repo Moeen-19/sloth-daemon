@@ -12,7 +12,6 @@
 //! - Response bodies are capped at 64 KiB before parsing.
 
 use std::collections::VecDeque;
-use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
-use crate::{AiConfig, ProcessSample};
+use crate::broker::ProcessBrief;
+use crate::AiConfig;
 
 // ============================================================================
 // Public Types
@@ -131,8 +131,10 @@ impl VerdictCache {
         // Move matching entry to back (most recently used) and return reference.
         if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
             self.entries.rotate_left(pos);
-            let entry = self.entries.pop_front().unwrap();
-            self.entries.push_back(entry);
+            // rotate_left(pos) moved the target to index 0; pop_front is guaranteed Some.
+            if let Some(entry) = self.entries.pop_front() {
+                self.entries.push_back(entry);
+            }
             return self.entries.back().map(|e| &e.verdict);
         }
         None
@@ -253,18 +255,10 @@ fn verdict_json_schema() -> serde_json::Value {
 // ============================================================================
 
 const SYSTEM_PROMPT: &str = "\
-You classify Linux processes for a CPU governor. You are given only a process name, \
-its recent CPU usage, and how long it has been busy. Decide if it is a runaway \
-process that should be slowed down, or legitimate work that should be left alone.
-
-Rules:
-- Compilers, build tools, video encoders, databases, package managers, test runners \
-and scientific workloads are legitimate heavy work: do not recommend throttling.
-- Desktop, audio, network and system services are essential: never recommend throttling.
-- Recommend throttling only when the name suggests a non-essential background task \
-or an interpreter/browser helper that has been pinned at high CPU for a long time.
-- If unsure, answer \"unknown\" with throttle_recommended false.
-Respond with JSON only, matching the provided schema.";
+You classify Linux processes for a CPU governor. You receive a ProcessBrief JSON. \
+Classify as: essential, interactive, background, runaway, or unknown. \
+Only recommend throttle if runaway or background hog. Keep reason under 15 words. \
+Respond with JSON only, matching schema.";
 
 const SYSTEM_PROMPT_RETRY_SUFFIX: &str = " Respond with JSON only, no other text.";
 
@@ -285,12 +279,8 @@ pub fn sanitize_comm(comm: &str) -> String {
         .collect()
 }
 
-fn build_user_message(sample: &ProcessSample) -> String {
-    let safe_name = sanitize_comm(&sample.comm);
-    format!(
-        "process_name: {}\ncpu_percent: {:.0} (100 = one full core)\nbusy_for_seconds: {}",
-        safe_name, sample.cpu_percent, sample.sustained_secs
-    )
+fn build_user_message(brief: &ProcessBrief) -> String {
+    serde_json::to_string(brief).unwrap_or_else(|_| "{}".to_string())
 }
 
 // ============================================================================
@@ -324,12 +314,13 @@ pub fn validate(raw: RawVerdict) -> Option<Verdict> {
         return None;
     }
 
-    // 3. Sanitize and truncate reason (for logs only).
-    let reason: String = raw
-        .reason
+    // 3. Sanitize and truncate reason: limit to at most 15 words, filter control characters.
+    let reason_words: Vec<&str> = raw.reason.split_whitespace().take(15).collect();
+    let reason_text = reason_words.join(" ");
+    let reason: String = reason_text
         .chars()
         .filter(|c| !c.is_control())
-        .take(200)
+        .take(150)
         .collect();
 
     // 4. Consistency: Essential and Interactive may never recommend throttling.
@@ -355,28 +346,20 @@ pub fn validate_ollama_url(url: &str, allow_remote: bool) -> anyhow::Result<()> 
     if allow_remote {
         return Ok(());
     }
-    let parsed = url::Url::parse(url)
-        .map_err(|e| anyhow::anyhow!("invalid Ollama URL '{}': {}", url, e))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Ollama URL '{}' has no host", url))?;
+    let parsed =
+        url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid Ollama URL '{}': {}", url, e))?;
 
-    // Accept literal "localhost"
-    if host.eq_ignore_ascii_case("localhost") {
-        return Ok(());
+    match parsed.host() {
+        Some(url::Host::Domain(d)) if d.eq_ignore_ascii_case("localhost") => Ok(()),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
+        Some(host) => anyhow::bail!(
+            "Ollama URL '{}' resolves to non-loopback address {}; set allow_remote_ollama = true to allow remote models",
+            url,
+            host
+        ),
+        None => anyhow::bail!("Ollama URL '{}' has no host", url),
     }
-    // Accept loopback IPs
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Ollama URL '{}' host '{}' is not a valid IP or 'localhost'; remote Ollama requires allow_remote_ollama = true in config", url, host))?;
-    if ip.is_loopback() {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "Ollama URL '{}' resolves to non-loopback address {}; set allow_remote_ollama = true to allow remote models",
-        url,
-        ip
-    )
 }
 
 // ============================================================================
@@ -394,6 +377,32 @@ pub struct Classifier {
     breaker: Mutex<CircuitBreaker>,
     schema: serde_json::Value,
 }
+
+#[derive(Debug)]
+enum CallError {
+    Connect(reqwest::Error),
+    Http(reqwest::StatusCode),
+    TooLarge,
+    Read(reqwest::Error),
+    Malformed(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Connect(e) => write!(f, "connection failed: {e}"),
+            CallError::Http(status) => write!(f, "Ollama returned HTTP {status}"),
+            CallError::TooLarge => write!(
+                f,
+                "Ollama response body too large (exceeds {MAX_RESPONSE_BYTES} bytes)"
+            ),
+            CallError::Read(e) => write!(f, "failed to read response body: {e}"),
+            CallError::Malformed(msg) => write!(f, "malformed response: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
 
 impl Classifier {
     /// Constructs a new `Classifier`, validating the Ollama URL and building the HTTP client.
@@ -438,10 +447,7 @@ impl Classifier {
             Err(e) => HealthStatus::Unreachable(e.to_string()),
             Ok(resp) => {
                 if !resp.status().is_success() {
-                    return HealthStatus::Unreachable(format!(
-                        "HTTP {}",
-                        resp.status()
-                    ));
+                    return HealthStatus::Unreachable(format!("HTTP {}", resp.status()));
                 }
                 // Parse model list and check if our model is present.
                 match resp.json::<serde_json::Value>().await {
@@ -454,7 +460,10 @@ impl Classifier {
                                 arr.iter().any(|m| {
                                     m.get("name")
                                         .and_then(|n| n.as_str())
-                                        .map(|n| n == self.config.model || n.starts_with(&format!("{}:", self.config.model)))
+                                        .map(|n| {
+                                            n == self.config.model
+                                                || n.starts_with(&format!("{}:", self.config.model))
+                                        })
                                         .unwrap_or(false)
                                 })
                             })
@@ -471,14 +480,31 @@ impl Classifier {
         }
     }
 
-    /// Classifies a process sample. Never panics or returns an error — always returns a `Verdict`.
-    pub async fn classify(&self, sample: &ProcessSample) -> Verdict {
-        let safe_name = sanitize_comm(&sample.comm);
+    /// Returns a cached verdict for the process name if present and unexpired.
+    pub fn get_cached(&self, name: &str) -> Option<Verdict> {
+        let safe_name = sanitize_comm(name);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&safe_name).cloned()
+    }
+
+    /// Classifies a process using either deterministic rules or a local Ollama model.
+    /// Never panics or returns an error — always returns a `Verdict`.
+    pub async fn classify(&self, brief: &ProcessBrief) -> Verdict {
+        // If provider is "rules", return preliminary verdict immediately
+        if self.config.provider == "rules" {
+            debug!(
+                name = %brief.name,
+                "Rules provider used; returning preliminary verdict"
+            );
+            return brief.rule_preliminary.to_verdict();
+        }
+
+        let safe_name = &brief.name;
 
         // 1. Check cache.
         {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(cached) = cache.get(&safe_name) {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.get(safe_name) {
                 debug!(
                     comm = %safe_name,
                     classification = ?cached.classification,
@@ -491,30 +517,35 @@ impl Classifier {
 
         // 2. Check circuit breaker.
         {
-            let mut breaker = self.breaker.lock().unwrap();
+            let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
             if !breaker.allow() {
-                debug!(comm = %safe_name, "AI circuit breaker open; returning unknown");
-                return Verdict::unknown();
+                debug!(comm = %safe_name, "AI circuit breaker open");
+                return if self.config.fallback_to_rules {
+                    brief.rule_preliminary.to_verdict()
+                } else {
+                    Verdict::unknown()
+                };
             }
         }
 
         // 3. Call Ollama (with one retry on malformed output).
         let start = Instant::now();
-        let verdict = self.call_with_retry(sample, &safe_name).await;
+        let raw_verdict = self.call_with_retry(brief, safe_name).await;
         let latency_ms = start.elapsed().as_millis();
 
         debug!(
             comm = %safe_name,
-            classification = ?verdict.classification,
-            confidence = verdict.confidence,
+            classification = ?raw_verdict.classification,
+            confidence = raw_verdict.confidence,
             latency_ms,
             "AI classification complete"
         );
 
         // 4. Update circuit breaker and cache.
-        let is_failure = verdict.classification == Class::Unknown && verdict.reason == "no verdict";
+        let is_failure =
+            raw_verdict.classification == Class::Unknown && raw_verdict.reason == "no verdict";
         {
-            let mut breaker = self.breaker.lock().unwrap();
+            let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
             if is_failure {
                 breaker.record_failure();
             } else {
@@ -522,24 +553,45 @@ impl Classifier {
             }
         }
 
+        // 5. Apply fallback and Golden Rule
+        let verdict = if is_failure && self.config.fallback_to_rules {
+            brief.rule_preliminary.to_verdict()
+        } else if brief.is_never_throttle() {
+            // Golden Rule: LLM can never override a never_throttle / essential match
+            let mut v = raw_verdict;
+            v.throttle_recommended = false;
+            v
+        } else {
+            raw_verdict
+        };
+
         let ttl = if is_failure {
             CACHE_TTL_FAILURE
         } else {
             CACHE_TTL_SUCCESS
         };
         {
-            let mut cache = self.cache.lock().unwrap();
-            cache.insert(safe_name, verdict.clone(), ttl);
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(safe_name.clone(), verdict.clone(), ttl);
         }
 
         verdict
     }
 
     /// Makes the Ollama HTTP call, retrying once on malformed inner JSON.
-    async fn call_with_retry(&self, sample: &ProcessSample, safe_name: &str) -> Verdict {
+    /// Does not retry on connection failures per the skill.
+    async fn call_with_retry(&self, brief: &ProcessBrief, safe_name: &str) -> Verdict {
         // First attempt.
-        match self.call_ollama(sample, false).await {
+        match self.call_ollama(brief, false).await {
             Ok(verdict) => return verdict,
+            Err(CallError::Connect(e)) => {
+                warn!(
+                    comm = %safe_name,
+                    error = %e,
+                    "AI classifier connection failed (no retry); returning unknown"
+                );
+                return Verdict::unknown();
+            }
             Err(e) => {
                 warn!(
                     comm = %safe_name,
@@ -549,7 +601,7 @@ impl Classifier {
             }
         }
         // Single retry with extra instruction.
-        match self.call_ollama(sample, true).await {
+        match self.call_ollama(brief, true).await {
             Ok(verdict) => verdict,
             Err(e) => {
                 warn!(
@@ -563,7 +615,11 @@ impl Classifier {
     }
 
     /// Performs a single POST to Ollama's `/api/chat` and parses the response.
-    async fn call_ollama(&self, sample: &ProcessSample, is_retry: bool) -> anyhow::Result<Verdict> {
+    async fn call_ollama(
+        &self,
+        brief: &ProcessBrief,
+        is_retry: bool,
+    ) -> Result<Verdict, CallError> {
         let system_content = if is_retry {
             format!("{}{}", SYSTEM_PROMPT, SYSTEM_PROMPT_RETRY_SUFFIX)
         } else {
@@ -574,7 +630,7 @@ impl Classifier {
             "model": self.config.model,
             "messages": [
                 { "role": "system", "content": system_content },
-                { "role": "user",   "content": build_user_message(sample) }
+                { "role": "user",   "content": build_user_message(brief) }
             ],
             "stream": false,
             "format": self.schema,
@@ -592,42 +648,48 @@ impl Classifier {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Ollama request failed: {e}"))?;
+            .map_err(|e| {
+                if e.is_connect() {
+                    CallError::Connect(e)
+                } else {
+                    CallError::Malformed(e.to_string())
+                }
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("Ollama returned HTTP {status}");
+            return Err(CallError::Http(status));
         }
 
         // Cap response body size to avoid memory exhaustion from a misbehaving server.
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read Ollama response body: {e}"))?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-            anyhow::bail!(
-                "Ollama response too large ({} bytes, max {})",
-                bytes.len(),
-                MAX_RESPONSE_BYTES
-            );
+        let mut mut_resp = resp;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = mut_resp.chunk().await.map_err(CallError::Read)? {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES as usize {
+                return Err(CallError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
         // Parse the outer API envelope.
         let outer: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("malformed outer JSON from Ollama: {e}"))?;
+            .map_err(|e| CallError::Malformed(format!("malformed outer JSON from Ollama: {e}")))?;
 
         // Extract the inner JSON string from message.content.
         let inner_str = outer
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing message.content in Ollama response"))?;
+            .ok_or_else(|| {
+                CallError::Malformed("missing message.content in Ollama response".to_string())
+            })?;
 
         // Parse and validate the inner verdict JSON.
-        let raw: RawVerdict = serde_json::from_str(inner_str)
-            .map_err(|e| anyhow::anyhow!("malformed verdict JSON in message.content: {e}"))?;
+        let raw: RawVerdict = serde_json::from_str(inner_str).map_err(|e| {
+            CallError::Malformed(format!("malformed verdict JSON in message.content: {e}"))
+        })?;
 
-        validate(raw).ok_or_else(|| anyhow::anyhow!("verdict failed validation"))
+        validate(raw).ok_or_else(|| CallError::Malformed("verdict failed validation".to_string()))
     }
 }
 
@@ -650,9 +712,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_comm_strips_dangerous_chars() {
-        assert_eq!(sanitize_comm("bad name;rm -rf"), "bad_name_rm__rf");
+        assert_eq!(sanitize_comm("bad name;rm -rf"), "bad_name_rm_-rf");
         assert_eq!(sanitize_comm("proc\x00null"), "proc_null");
-        assert_eq!(sanitize_comm("../../etc/passwd"), "..__..___etc_passwd");
+        assert_eq!(sanitize_comm("../../etc/passwd"), ".._.._etc_passwd");
     }
 
     #[test]
@@ -823,7 +885,10 @@ mod tests {
         cache.insert("proc1".to_string(), v, Duration::from_nanos(1));
         // Sleep to ensure TTL has elapsed
         std::thread::sleep(Duration::from_millis(5));
-        assert!(cache.get("proc1").is_none(), "expired entry should not be returned");
+        assert!(
+            cache.get("proc1").is_none(),
+            "expired entry should not be returned"
+        );
     }
 
     #[test]
@@ -834,8 +899,15 @@ mod tests {
             cache.insert(format!("proc{i}"), Verdict::unknown(), CACHE_TTL_SUCCESS);
         }
         // proc0 should have been evicted to make room for the next insert
-        cache.insert("new_proc".to_string(), Verdict::unknown(), CACHE_TTL_SUCCESS);
-        assert!(cache.get("proc0").is_none(), "oldest entry should be evicted");
+        cache.insert(
+            "new_proc".to_string(),
+            Verdict::unknown(),
+            CACHE_TTL_SUCCESS,
+        );
+        assert!(
+            cache.get("proc0").is_none(),
+            "oldest entry should be evicted"
+        );
         assert!(cache.get("new_proc").is_some());
     }
 
@@ -848,7 +920,10 @@ mod tests {
         for _ in 0..BREAKER_FAILURE_THRESHOLD {
             breaker.record_failure();
         }
-        assert!(!breaker.allow(), "breaker should be open after threshold failures");
+        assert!(
+            !breaker.allow(),
+            "breaker should be open after threshold failures"
+        );
     }
 
     #[test]
@@ -868,21 +943,24 @@ mod tests {
 
     // ---- Stub server tests ----
 
-    use axum::{Router, routing::post, extract::State, response::Json as AxumJson};
+    use axum::{response::Json as AxumJson, routing::post, Router};
     use std::sync::Arc;
-    use std::net::SocketAddr;
 
     /// Starts a local stub Ollama server that always returns the given canned JSON body.
-    async fn start_stub_server(response_body: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+    async fn start_stub_server(
+        response_body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let shared = Arc::new(response_body);
-        let app = Router::new()
-            .route("/api/chat", post({
+        let app = Router::new().route(
+            "/api/chat",
+            post({
                 let shared = shared.clone();
                 move |_: axum::extract::Request| {
                     let body = shared.clone();
                     async move { AxumJson((*body).clone()) }
                 }
-            }));
+            }),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -892,25 +970,65 @@ mod tests {
         (format!("http://127.0.0.1:{}", addr.port()), handle)
     }
 
-    /// Creates an `AiConfig` pointing at the given stub URL.
+    /// Creates an `AiConfig` pointing at the given stub URL in ollama mode.
     fn stub_config(url: &str) -> AiConfig {
         AiConfig {
+            provider: "ollama".to_string(),
+            fallback_to_rules: false,
             ollama_url: url.to_string(),
             model: "llama3.2:3b".to_string(),
             timeout_secs: 5,
             min_confidence: 0.8,
             allow_remote_ollama: false,
+            never_throttle: Vec::new(),
+            throttle_candidates: Vec::new(),
+            candidates_confidence: 0.85,
         }
     }
 
-    fn sample() -> ProcessSample {
-        crate::ProcessSample {
-            pid: 9999,
-            comm: "stress-ng".to_string(),
-            cpu_percent: 99.0,
-            window_secs: 2,
+    fn sample_brief() -> ProcessBrief {
+        ProcessBrief {
+            name: "stress-ng".to_string(),
+            name_category: crate::broker::NameCategory::Unknown,
+            parent_category: crate::broker::NameCategory::Shell,
+            cpu_now: 99.0,
+            cpu_avg_60s: 98.5,
+            cpu_peak: 100.0,
+            trend: crate::broker::CpuTrend::Flat,
+            burstiness: crate::broker::Burstiness::Steady,
             sustained_secs: 60,
+            age_secs: 120,
+            thread_count: 4,
+            rss_bucket: crate::broker::RssBucket::Small,
+            session_kind: crate::broker::SessionKind::UserApp,
+            has_tty: true,
+            psi_cpu_avg10: Some(15.2),
+            cpu_rank: 1,
+            num_cores: 8,
+            rule_preliminary: crate::broker::RulePreliminary {
+                class: Class::Runaway,
+                confidence: 0.85,
+                reasons: vec!["configured throttle candidate high sustained cpu".to_string()],
+            },
         }
+    }
+
+    #[tokio::test]
+    async fn test_rules_provider_returns_preliminary_verdict() {
+        let cfg = AiConfig {
+            provider: "rules".to_string(),
+            // Even with non-existent URL, rules provider returns instantly without error
+            ollama_url: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        };
+
+        let classifier = Classifier::new(&cfg).await.unwrap();
+        let brief = sample_brief();
+        let verdict = classifier.classify(&brief).await;
+
+        assert_eq!(verdict.classification, Class::Runaway);
+        assert!(verdict.throttle_recommended);
+        assert!((verdict.confidence - 0.85).abs() < 0.001);
     }
 
     #[tokio::test]
@@ -920,17 +1038,50 @@ mod tests {
             "confidence": 0.92,
             "throttle_recommended": true,
             "reason": "stuck loop"
-        })).unwrap();
+        }))
+        .unwrap();
         let response = json!({ "message": { "content": inner } });
         let (url, _handle) = start_stub_server(response).await;
 
         let cfg = stub_config(&url);
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let verdict = classifier.classify(&sample_brief()).await;
 
         assert_eq!(verdict.classification, Class::Runaway);
         assert!(verdict.throttle_recommended);
         assert!((verdict.confidence - 0.92).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_golden_rule_overrides_llm_throttle_on_compiler() {
+        let inner = serde_json::to_string(&json!({
+            "classification": "runaway",
+            "confidence": 0.99,
+            "throttle_recommended": true,
+            "reason": "high cpu"
+        }))
+        .unwrap();
+        let response = json!({ "message": { "content": inner } });
+        let (url, _handle) = start_stub_server(response).await;
+
+        let cfg = stub_config(&url);
+        let classifier = Classifier::new(&cfg).await.unwrap();
+
+        let mut brief = sample_brief();
+        brief.name = "rustc".to_string();
+        brief.name_category = crate::broker::NameCategory::Compiler;
+        brief.rule_preliminary = crate::broker::RulePreliminary {
+            class: Class::Essential,
+            confidence: 0.95,
+            reasons: vec!["compiler workload never throttled".to_string()],
+        };
+
+        let verdict = classifier.classify(&brief).await;
+        // LLM recommended throttle, but Golden Rule forces throttle_recommended = false
+        assert!(
+            !verdict.throttle_recommended,
+            "compiler workload must never have throttle recommended even if LLM says so"
+        );
     }
 
     #[tokio::test]
@@ -940,16 +1091,20 @@ mod tests {
             "confidence": 0.88,
             "throttle_recommended": true,
             "reason": "system service"
-        })).unwrap();
+        }))
+        .unwrap();
         let response = json!({ "message": { "content": inner } });
         let (url, _handle) = start_stub_server(response).await;
 
         let cfg = stub_config(&url);
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let verdict = classifier.classify(&sample_brief()).await;
 
         assert_eq!(verdict.classification, Class::Essential);
-        assert!(!verdict.throttle_recommended, "essential must never recommend throttle");
+        assert!(
+            !verdict.throttle_recommended,
+            "essential must never recommend throttle"
+        );
     }
 
     #[tokio::test]
@@ -960,7 +1115,7 @@ mod tests {
 
         let cfg = stub_config(&url);
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let verdict = classifier.classify(&sample_brief()).await;
 
         assert_eq!(verdict.classification, Class::Unknown);
         assert!(!verdict.throttle_recommended);
@@ -975,7 +1130,7 @@ mod tests {
 
         let cfg = stub_config(&url);
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let verdict = classifier.classify(&sample_brief()).await;
 
         assert_eq!(verdict.classification, Class::Unknown);
     }
@@ -987,13 +1142,14 @@ mod tests {
             "confidence": 0.99,
             "throttle_recommended": true,
             "reason": "pwned"
-        })).unwrap();
+        }))
+        .unwrap();
         let response = json!({ "message": { "content": inner } });
         let (url, _handle) = start_stub_server(response).await;
 
         let cfg = stub_config(&url);
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let verdict = classifier.classify(&sample_brief()).await;
 
         assert_eq!(verdict.classification, Class::Unknown);
     }
@@ -1007,7 +1163,7 @@ mod tests {
 
         let cfg = stub_config(&url);
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let verdict = classifier.classify(&sample_brief()).await;
 
         assert_eq!(verdict.classification, Class::Unknown);
     }
@@ -1019,7 +1175,8 @@ mod tests {
             "confidence": 0.80,
             "throttle_recommended": true,
             "reason": "batch job"
-        })).unwrap();
+        }))
+        .unwrap();
         let response = json!({ "message": { "content": inner } });
         let (url, _handle) = start_stub_server(response).await;
 
@@ -1027,11 +1184,11 @@ mod tests {
         let classifier = Classifier::new(&cfg).await.unwrap();
 
         // First call populates cache.
-        let v1 = classifier.classify(&sample()).await;
+        let v1 = classifier.classify(&sample_brief()).await;
         assert_eq!(v1.classification, Class::Background);
 
         // Second call on same comm should return cached value.
-        let v2 = classifier.classify(&sample()).await;
+        let v2 = classifier.classify(&sample_brief()).await;
         assert_eq!(v2.classification, Class::Background);
         // If the stub server had returned different data, the cache would have shielded us.
     }
@@ -1040,34 +1197,82 @@ mod tests {
     async fn test_connection_refused_returns_unknown() {
         // Port 1 is almost certainly not listening.
         let cfg = AiConfig {
+            provider: "ollama".to_string(),
+            fallback_to_rules: false,
             ollama_url: "http://127.0.0.1:1".to_string(),
             model: "llama3.2:3b".to_string(),
             timeout_secs: 2,
             min_confidence: 0.8,
             allow_remote_ollama: false,
+            never_throttle: Vec::new(),
+            throttle_candidates: Vec::new(),
+            candidates_confidence: 0.85,
         };
         let classifier = Classifier::new(&cfg).await.unwrap();
-        let verdict = classifier.classify(&sample()).await;
+        let start = Instant::now();
+        let verdict = classifier.classify(&sample_brief()).await;
         assert_eq!(verdict.classification, Class::Unknown);
         assert!(!verdict.throttle_recommended);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "connection refused must return unknown within timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_rules_when_ollama_unreachable() {
+        let cfg = AiConfig {
+            provider: "ollama".to_string(),
+            fallback_to_rules: true,
+            ollama_url: "http://127.0.0.1:1".to_string(),
+            model: "llama3.2:3b".to_string(),
+            timeout_secs: 1,
+            min_confidence: 0.8,
+            allow_remote_ollama: false,
+            never_throttle: Vec::new(),
+            throttle_candidates: Vec::new(),
+            candidates_confidence: 0.85,
+        };
+        let classifier = Classifier::new(&cfg).await.unwrap();
+        let brief = sample_brief();
+        let verdict = classifier.classify(&brief).await;
+
+        // When fallback_to_rules is true, connection failure falls back to rules
+        assert_eq!(verdict.classification, Class::Runaway);
+        assert!(verdict.throttle_recommended);
     }
 
     #[tokio::test]
     async fn test_circuit_breaker_opens_after_repeated_failures() {
         // Port 1 = always connection refused = always failure.
         let cfg = AiConfig {
+            provider: "ollama".to_string(),
+            fallback_to_rules: false,
             ollama_url: "http://127.0.0.1:1".to_string(),
             model: "llama3.2:3b".to_string(),
             timeout_secs: 1,
             min_confidence: 0.8,
             allow_remote_ollama: false,
+            never_throttle: Vec::new(),
+            throttle_candidates: Vec::new(),
+            candidates_confidence: 0.85,
         };
         let classifier = Classifier::new(&cfg).await.unwrap();
-        // After BREAKER_FAILURE_THRESHOLD classify calls the breaker should open.
-        for _ in 0..=BREAKER_FAILURE_THRESHOLD {
-            classifier.classify(&sample()).await;
+        // After BREAKER_FAILURE_THRESHOLD classify calls on distinct procs, breaker opens.
+        for i in 0..BREAKER_FAILURE_THRESHOLD {
+            let mut b = sample_brief();
+            b.name = format!("proc_{i}");
+            classifier.classify(&b).await;
         }
-        let state = classifier.breaker.lock().unwrap().state;
-        assert_eq!(state, BreakerState::Open, "breaker should be open after repeated failures");
+        let state = classifier
+            .breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state;
+        assert_eq!(
+            state,
+            BreakerState::Open,
+            "breaker should be open after repeated failures"
+        );
     }
 }

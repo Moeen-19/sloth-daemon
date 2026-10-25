@@ -9,16 +9,16 @@ Use this skill whenever you write or change `sloth-daemon/src/ai_classifier.rs` 
 
 ## Mission
 
-Turn a small, privacy-safe `ProcessSample` into a validated `Verdict` using a **local** Ollama model. The model is advisory. Bad, slow, or missing output must degrade to `unknown`, which means "do not throttle".
+Turn a compact, privacy-safe `ProcessBrief` (prepared deterministically by `broker.rs`) into a validated `Verdict` using a **local** Ollama model or deterministic rules fallback. The model is advisory. Bad, slow, or missing output must degrade to `unknown`, which means "do not throttle" (unless `fallback_to_rules = true`).
 
 ## Ground Rules
 
 1. **Local only.** The only host the daemon may contact is the configured Ollama URL (default `http://localhost:11434`). Refuse to start the classifier if the configured URL is not a loopback address, unless the user explicitly sets an `allow_remote_ollama = true` flag. Never contact any other host.
-2. **Minimal prompt.** Include only: process name (`comm`), CPU percent, and how long it has been busy. Never include command-line arguments, environment variables, file paths, usernames, hostnames, or anything read from `/proc/<pid>/cmdline|environ|cwd`.
-3. **Sanitize the name.** `comm` is at most 15 bytes but is attacker-controlled. Before putting it in the prompt, keep only `[A-Za-z0-9._+-]`, replace everything else with `_`, and truncate to 32 characters. Never put it anywhere except inside the prompt's data section.
+2. **Derived features only.** The prompt is built from `ProcessBrief` containing compact derived facts: sanitized name, categories, CPU history & trends, duration, age, threads, RSS bucket, session kind, tty flag, system context, and preliminary rule verdict. Never include command-line arguments, environment variables, file paths, usernames, hostnames, or raw cgroup paths.
+3. **Sanitize the name.** `comm` is attacker-controlled. Keep only `[A-Za-z0-9._+-]`, replace everything else with `_`, and truncate to 32 characters.
 4. **Treat the model's output as untrusted.** Parse strictly, validate ranges, and never use any model text to build a path, command, or cgroup write. Only the `Verdict` enum and numbers leave this module.
 5. **Never block the control loop.** Classification is async with a hard timeout. A slow model must not stop sampling.
-6. **Fail closed.** Any error returns `Verdict::unknown()`.
+6. **Fail closed.** Any error returns `Verdict::unknown()`, or the preliminary rule verdict if `fallback_to_rules = true`.
 
 ## Ollama API Facts
 
@@ -102,32 +102,22 @@ Build it once with `serde_json::json!` and reuse it.
 
 ## Prompt Template
 
-System message (fixed text, no user data):
+System message (fixed text, concise for small 0.5B-3B models):
 
 ```
-You classify Linux processes for a CPU governor. You are given only a process name,
-its recent CPU usage, and how long it has been busy. Decide if it is a runaway
-process that should be slowed down, or legitimate work that should be left alone.
-
-Rules:
-- Compilers, build tools, video encoders, databases, package managers, test runners
-  and scientific workloads are legitimate heavy work: do not recommend throttling.
-- Desktop, audio, network and system services are essential: never recommend throttling.
-- Recommend throttling only when the name suggests a non-essential background task
-  or an interpreter/browser helper that has been pinned at high CPU for a long time.
-- If unsure, answer "unknown" with throttle_recommended false.
-Respond with JSON only, matching the provided schema.
+You classify Linux processes for a CPU governor. You receive a ProcessBrief JSON.
+Classify as: essential, interactive, background, runaway, or unknown.
+Only recommend throttle if runaway or background hog. Keep reason under 15 words.
+Respond with JSON only, matching schema.
 ```
 
-User message (the only place data appears):
+User message (compact serialized ProcessBrief JSON):
 
 ```
-process_name: {sanitized_comm}
-cpu_percent: {cpu:.0} (100 = one full core)
-busy_for_seconds: {sustained_secs}
+{"name":"python3","name_category":"interpreter","parent_category":"shell","cpu_now":98.0,"cpu_avg_60s":95.2,"cpu_peak":99.0,"trend":"flat","burstiness":"steady","sustained_secs":45,"age_secs":120,"thread_count":1,"rss_bucket":"medium","session_kind":"user_app","has_tty":true,"psi_cpu_avg10":12.4,"cpu_rank":1,"num_cores":8,"rule_preliminary":{"class":"runaway","confidence":0.85,"reasons":["candidate interpreter high sustained cpu"]}}
 ```
 
-Keep the system text as a constant. Because the process name is untrusted, it appears only in the user message and only after sanitization. The model must not be able to change the schema or the rules by naming a process cleverly; the strict output validation and the deterministic policy gate are the real defence, and prompt wording is secondary.
+Keep the system text as a constant. The brief is untrusted data and serialized strictly without paths, usernames, or cmdlines. The reason returned by the model is capped to 15 words.
 
 ## HTTP Client Rules (`reqwest`)
 

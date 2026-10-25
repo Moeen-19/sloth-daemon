@@ -1,0 +1,49 @@
+# sloth-daemon.service — example systemd unit for sloth-daemon.
+#
+# Copy to /etc/systemd/system/sloth-daemon.service, then:
+#   systemctl daemon-reload
+#   systemctl enable --now sloth-daemon
+#
+# The daemon needs the eBPF-related capabilities listed below.
+# CAP_SYS_ADMIN is required only for moving processes between cgroups on some
+# kernels; remove it if your kernel (≥ 5.14) allows it without it.
+
+[Unit]
+Description=Sloth Daemon — AI-assisted eBPF CPU governor
+Documentation=file:///opt/sloth-daemon/README.md
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sloth-daemon --config /etc/sloth-daemon/sloth.toml
+Restart=on-failure
+RestartSec=5s
+
+# Drop all privileges then grant only what is needed.
+User=root
+NoNewPrivileges=yes
+
+# Minimal capability set:
+#   CAP_BPF        — load and pin eBPF programs/maps
+#   CAP_PERFMON    — attach to tracepoints (sched_switch, sched_process_exit)
+#   CAP_SYS_RESOURCE — write cpu.max / create cgroup directories
+#   CAP_SYS_ADMIN  — move PIDs between cgroups (cgroup.procs write)
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_ADMIN
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_ADMIN
+
+# Harden the service environment.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=no     # must be no — the daemon writes to /sys/fs/cgroup
+ReadWritePaths=/sys/fs/cgroup/sloth-daemon
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

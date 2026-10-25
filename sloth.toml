@@ -10,13 +10,17 @@ sustained_secs = 30
 quota_pct = 20
 max_concurrent = 5
 ttl_secs = 600
-release_below_pct = 50.0
+cool_down_samples = 5
 
 [ai]
+provider = "rules"
+fallback_to_rules = false
 ollama_url = "http://localhost:11434"
-model = "llama3.2:3b"
-timeout_secs = 20
+model = "qwen2.5:0.5b"
+timeout_secs = 60
 min_confidence = 0.8
+never_throttle = []
+throttle_candidates = []
 
 [protected]
 extra_names = []

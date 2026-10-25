@@ -91,7 +91,7 @@ PID 1, the daemon itself and its parent, kernel threads (no `/proc/<pid>/exe`, o
 ### 5.4 The AI is advisory only
 - The LLM returns a verdict. A deterministic policy function decides the action.
 - Treat all model output as **untrusted input**: parse strictly, validate ranges, ignore unknown fields, and never use any model text to build a file path, shell command, or cgroup write.
-- The prompt contains only: process name, CPU%, and duration. Never include command-line arguments, environment, file paths, usernames, or other process data. Never send data anywhere except the local Ollama URL from the config.
+- The prompt contains only the compact derived features of `ProcessBrief`: sanitized name, categories, CPU history & trends, duration, age, thread count, RSS bucket, session kind, tty flag, system context, and preliminary rule verdict. Never include command-line arguments, environment variables, file paths, usernames, hostnames, or raw cgroup paths. Never send data anywhere except the local Ollama URL from the config.
 
 ### 5.5 Dangerous operations need the user
 Stop and ask before: running anything with `sudo`, running the daemon with `dry_run = false`, deleting files outside `target/`, modifying anything outside the repo directory, changing kernel parameters (`sysctl`), or loading or unloading kernel modules.
@@ -113,7 +113,9 @@ Stop and ask before: running anything with `sudo`, running the daemon with `dry_
 | File | Responsibility | Must not contain |
 |:--|:--|:--|
 | `sloth-ebpf/src/main.rs` | Tracepoint programs and BPF maps | Policy, thresholds, string handling |
-| `sloth-daemon/src/main.rs` | Config, preflight, loading the probe, sampling, control loop, policy gate, signals | Raw HTTP calls, raw cgroup file writes |
+| `sloth-daemon/src/main.rs` | Config, preflight, loading the probe, sampling, control loop, signal handling | Raw HTTP calls, raw cgroup file writes, policy logic |
+| `sloth-daemon/src/broker.rs` | Evidence Broker: `ProcessBrief`, /proc metrics, sampler history ring buffer, category rules, preliminary verdict | Raw HTTP calls, cgroup manipulation |
+| `sloth-daemon/src/policy.rs` | Policy Gate: deterministic decisions (`decide`), `PolicyState`, hysteresis, TTL | Raw HTTP calls, raw cgroup file writes |
 | `sloth-daemon/src/ai_classifier.rs` | Ollama HTTP, prompt, parsing, cache, fallback | Cgroup logic, process killing |
 | `sloth-daemon/src/cgroup_manager.rs` | All `/sys/fs/cgroup` access, protected list enforcement, release logic | HTTP, AI logic |
 

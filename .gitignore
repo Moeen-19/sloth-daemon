@@ -1,0 +1,33 @@
+Here is a `.gitignore` tailored for this Rust and eBPF workspace:
+
+```gitignore
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo temporary files
+*.cargo-ok
+
+# Local configuration overrides & secret tokens
+*.local.toml
+sloth.local.toml
+
+# Operational logs & traces
+*.log
+logs/
+
+# eBPF / temporary compilation binaries
+*.o
+*.bin
+
+# Editor & IDE directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+```
