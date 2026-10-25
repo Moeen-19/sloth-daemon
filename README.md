@@ -57,7 +57,7 @@ If Ollama is unreachable or returns bad output, the verdict is `unknown` and not
 
 - Linux with **cgroup v2** (unified hierarchy) mounted at `/sys/fs/cgroup`
 - A kernel with BTF (`/sys/kernel/btf/vmlinux` exists) and the `sched_switch` tracepoint
-- Root, or the capabilities `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE` (and `CAP_SYS_ADMIN` only if needed)
+- Root, or the capabilities `CAP_BPF` and `CAP_PERFMON` (the systemd unit runs as root with only these two)
 - Rust stable plus a **nightly** toolchain with `rust-src` for the eBPF crate
 - `bpf-linker`
 - *Optional, LLM mode only:* [Ollama](https://ollama.com) with a small model. The daemon speaks Ollama's HTTP API; other backends (llama.cpp server, vLLM) are not supported. The recommended minimum model is `qwen2.5:0.5b` (roughly 400 MB).
@@ -185,7 +185,7 @@ kill <PID>                                             # stop your test process
 
 ## Running as a Service
 
-A systemd unit file is provided at [`sloth-daemon.service`](sloth-daemon.service). **It has not been tested as a running service yet.** The daemon itself has been tested as root. The capability list below is a starting point, so trim it if your setup works without all of them.
+A systemd unit file is provided at [`sloth-daemon.service`](sloth-daemon.service). It has been tested as a running service (throttle, release, SIGTERM shutdown and cleanup) with only `CAP_BPF` and `CAP_PERFMON`.
 
 ```bash
 sudo cp target/release/sloth-daemon /usr/local/bin/
@@ -198,12 +198,13 @@ sudo systemctl enable --now sloth-daemon
 journalctl -u sloth-daemon -f
 ```
 
-Capabilities set in the unit: `CAP_BPF` and `CAP_PERFMON` for loading eBPF and attaching tracepoints; `CAP_SYS_RESOURCE` and `CAP_SYS_ADMIN` for cgroup operations, which may be reducible depending on your cgroup setup. All other capabilities are dropped.
+Capabilities set in the unit: `CAP_BPF` and `CAP_PERFMON`, for loading eBPF and attaching tracepoints. All other capabilities are dropped. The cgroup operations (create directory, write `cpu.max`, move PIDs) need no capability because the service runs as root and they are checked by file permissions. If your system behaves differently, permission errors in `journalctl -u sloth-daemon` will say which operation failed. Note that the unit does not set `ProtectKernelTunables` or `ReadWritePaths`, because the daemon must write under `/sys/fs/cgroup` to release processes back to their original cgroup.
 
 ## Tested On
 
 - Arch Linux, cgroup v2, kernel `7.2.11-arch1-1` (unit tests, live throttle/release, crash recovery)
-- Rules mode: tested live. LLM mode: tested live in dry-run with `qwen2.5:0.5b` on Ollama (about 10 s per verdict on an old laptop CPU) and against a mock Ollama server.
+- systemd service: tested live (throttle, release, SIGTERM, no leftovers)
+- Rules mode: tested live. LLM mode: tested live in dry-run with `qwen2.5:0.5b, gemma3:1b` on Ollama (about 10 s per verdict on an old laptop CPU) and against a mock Ollama server.
 
 ## Limitations
 
@@ -211,7 +212,6 @@ Capabilities set in the unit: `CAP_BPF` and `CAP_PERFMON` for loading eBPF and a
 - Linux with pure cgroup v2 only. No cgroup v1 or hybrid setups.
 - The LLM sees only derived facts about a process, so it can misjudge unusual workloads. The policy gate, protected list and dry-run mode are the safety net.
 - Small local models are weak. The evidence brief is what makes them usable.
-- CPU time is credited when a task is switched out, so readings for an uninterrupted task can lag by a sample.
 
 ## Project Structure
 
@@ -265,4 +265,4 @@ Development follows the phased plan in `blueprint.md` and the rules in `instruct
 
 ## License
 
-Distributed under the MIT License. See [`LICENSE`](LICENSE).
+Distributed under the AGPL-3.0 License. See [`LICENSE`](LICENSE).
